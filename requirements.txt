@@ -1,0 +1,7 @@
+streamlit
+pdfplumber
+pymupdf        # (import name: fitz)
+pandas
+openpyxl
+python-dateutil
+pydantic
