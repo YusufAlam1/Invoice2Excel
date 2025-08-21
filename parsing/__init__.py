@@ -1,0 +1,1 @@
+from .randstad_parser import parse_invoice
