@@ -1,48 +1,107 @@
 from pathlib import Path
 import pandas as pd
-from openpyxl import load_workbook
+from openpyxl import load_workbook, Workbook
+from openpyxl.worksheet.worksheet import Worksheet
 from core.models import InvoiceRow
 
-def _ensure_workbook(path: Path):
-    if not path.exists():
-        with pd.ExcelWriter(path, engine="openpyxl") as w:
-            pd.DataFrame(columns=[
-                "Employee","Invoice #","Period","Hours","Rate",
-                "Amount","HST","Total","Invoice Date","Due Date"
-            ]).to_excel(w, sheet_name="Total Invoice Paid", index=False)
-            pd.DataFrame(columns=["Year-Month","HST"]).to_excel(w, sheet_name="Total Tax", index=False)
+HEADERS = [
+    "Invoice #",
+    "Period",
+    "Hours Worked",
+    "Rate",
+    "Amount",
+    "HST",
+    "Date & Time Paid",   # user-entered later; we write blank
+]
 
-def save_row(path: Path, row: InvoiceRow):
-    _ensure_workbook(path)
+NUMERIC_COLS = {
+    "Hours Worked",
+    "Rate",
+    "Amount",
+    "HST",
+}
 
-    # Per-employee sheet (openpyxl for simple append)
-    wb = load_workbook(path)
-    if row.employee not in wb.sheetnames:
-        ws = wb.create_sheet(row.employee)
-        ws.append(["Invoice #","Week / Period","Worked","Rate","Amount","HST","Date & Time Paid","Notes"])
-    ws = wb[row.employee]
-    ws.append([row.invoice_no, row.period, row.hours, row.rate, row.amount, row.hst, "", ""])
-    wb.save(path)
+EXCEL_NUM_FORMAT = "#,##0.00"
 
-    # Global sheets with pandas
-    df_total = pd.read_excel(path, sheet_name="Total Invoice Paid")
-    df_total.loc[len(df_total)] = [
-        row.employee, row.invoice_no, row.period, row.hours, row.rate,
-        row.amount, row.hst, row.total, row.invoice_date, row.due_date
-    ]
+def row_to_df(row: InvoiceRow) -> pd.DataFrame:
+    data = {
+        "Invoice #": row.invoice_no,
+        "Period": row.period,        # keep as text (two dates with a dash)
+        "Hours Worked": row.hours,
+        "Rate": row.rate,
+        "Amount": row.amount,
+        "HST": row.hst,
+        "Date & Time Paid": "",      # left blank for user
+    }
+    return pd.DataFrame([data], columns=HEADERS)
 
-    # Monthly HST
-    from dateutil import parser as dparser
-    try:
-        ym = dparser.parse(row.invoice_date, dayfirst=False).strftime("%Y-%m")
-    except Exception:
-        ym = "Unknown"
-    df_tax = pd.read_excel(path, sheet_name="Total Tax")
-    if (df_tax["Year-Month"] == ym).any():
-        df_tax.loc[df_tax["Year-Month"] == ym, "HST"] += row.hst
-    else:
-        df_tax.loc[len(df_tax)] = [ym, row.hst]
+def _ensure_employee_sheet(wb: Workbook, sheet_name: str) -> Worksheet:
+    """
+    Create the sheet with the exact header row if it doesn't exist.
+    If it exists, leave headers as-is (per your constraint to ignore legacy headers).
+    """
+    if sheet_name not in wb.sheetnames:
+        ws = wb.create_sheet(title=sheet_name)
+        ws.append(HEADERS)
+        # widths for A..G (7 columns)
+        widths = [14, 22, 14, 10, 12, 10, 18]
+        for i, w in enumerate(widths, start=1):
+            ws.column_dimensions[chr(64 + i)].width = w
+        return ws
+    return wb[sheet_name]
 
-    with pd.ExcelWriter(path, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
-        df_total.to_excel(w, sheet_name="Total Invoice Paid", index=False)
-        df_tax.to_excel(w, sheet_name="Total Tax", index=False)
+def _invoice_exists(ws: Worksheet, invoice_no: str) -> bool:
+    """
+    Check Column A ("Invoice #") for an existing value (case-sensitive match on the text).
+    Assumes header is on row 1, data starts row 2.
+    """
+    if ws.max_row < 2:
+        return False
+    for cell in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=1, values_only=True):
+        existing = cell[0]
+        if existing is not None and str(existing).strip() == str(invoice_no).strip():
+            return True
+    return False
+
+def _apply_cell_formats(ws: Worksheet, row_idx: int):
+    """After writing a row, apply basic number formats to the just-written cells."""
+    # Map header name → column index
+    header_to_col = {ws.cell(row=1, column=c).value: c for c in range(1, ws.max_column + 1)}
+
+    # Number formats
+    for name in NUMERIC_COLS:
+        c = header_to_col.get(name)
+        if c:
+            ws.cell(row=row_idx, column=c).number_format = EXCEL_NUM_FORMAT
+
+def save_employee_row(excel_path: Path, row: InvoiceRow):
+    if not excel_path.exists():
+        raise FileNotFoundError(f"No workbook found at: {excel_path}")
+
+    wb = load_workbook(excel_path)
+
+    ws = _ensure_employee_sheet(wb, row.employee)
+
+    if _invoice_exists(ws, row.invoice_no):
+        raise ValueError("invoice has already been written to file")
+
+    df = row_to_df(row)
+
+    next_r = ws.max_row + 1
+    values = df.iloc[0].to_dict()
+
+    for col_idx, header in enumerate(HEADERS, start=1):
+        val = values.get(header, "")
+        if header in NUMERIC_COLS:
+            try:
+                val = float(val)
+            except Exception:
+                pass
+            ws.cell(row=next_r, column=col_idx, value=val)
+        else:
+            ws.cell(row=next_r, column=col_idx, value=val)
+
+    _apply_cell_formats(ws, next_r)
+
+    wb.save(excel_path)
+    wb.close()
